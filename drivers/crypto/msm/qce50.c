@@ -4155,6 +4155,122 @@ static int qce_init_ce_cfg_val(struct qce_device *pce_dev)
 	return 0;
 }
 
+static void _qce_ccm_get_around_input(struct qce_device *pce_dev,
+	struct ce_request_info *preq_info, enum qce_cipher_dir_enum dir)
+{
+	struct qce_cmdlist_info *cmdlistinfo;
+	struct ce_sps_data *pce_sps_data;
+
+	pce_sps_data = &preq_info->ce_sps;
+	if ((dir == QCE_DECRYPT) && pce_dev->no_get_around &&
+			!(pce_dev->no_ccm_mac_status_get_around)) {
+		cmdlistinfo = &pce_sps_data->cmdlistptr.cipher_null;
+		_qce_sps_add_cmd(pce_dev, 0, cmdlistinfo,
+				&pce_sps_data->in_transfer);
+		_qce_sps_add_data(GET_PHYS_ADDR(pce_sps_data->ignore_buffer),
+			pce_dev->ce_bam_info.ce_burst_size,
+			&pce_sps_data->in_transfer);
+		_qce_set_flag(&pce_sps_data->in_transfer,
+				SPS_IOVEC_FLAG_EOT | SPS_IOVEC_FLAG_NWD);
+	}
+}
+
+static void _qce_ccm_get_around_output(struct qce_device *pce_dev,
+	struct ce_request_info *preq_info, enum qce_cipher_dir_enum dir)
+{
+	struct ce_sps_data *pce_sps_data;
+
+	pce_sps_data = &preq_info->ce_sps;
+
+	if ((dir == QCE_DECRYPT) && pce_dev->no_get_around &&
+			!(pce_dev->no_ccm_mac_status_get_around)) {
+		_qce_sps_add_data(GET_PHYS_ADDR(pce_sps_data->ignore_buffer),
+			pce_dev->ce_bam_info.ce_burst_size,
+			&pce_sps_data->out_transfer);
+		_qce_sps_add_data(GET_PHYS_ADDR(pce_sps_data->result_dump_null),
+			CRYPTO_RESULT_DUMP_SIZE, &pce_sps_data->out_transfer);
+	}
+}
+
+/* QCE_DUMMY_REQ */
+static void qce_dummy_complete(void *cookie, unsigned char *digest,
+		unsigned char *authdata, int ret)
+{
+	if (!cookie)
+		pr_err("invalid cookie\n");
+}
+
+static int qce_dummy_req(struct qce_device *pce_dev)
+{
+	int ret = 0;
+
+	if (!(atomic_xchg(&pce_dev->ce_request_info[DUMMY_REQ_INDEX].
+				in_use, true) == false))
+		return -EBUSY;
+	ret = qce_process_sha_req(pce_dev, NULL);
+	pce_dev->qce_stats.no_of_dummy_reqs++;
+	return ret;
+}
+
+static int select_mode(struct qce_device *pce_dev,
+		struct ce_request_info *preq_info)
+{
+	struct ce_sps_data *pce_sps_data = &preq_info->ce_sps;
+	unsigned int no_of_queued_req;
+	unsigned int cadence;
+
+	if (!pce_dev->no_get_around) {
+		_qce_set_flag(&pce_sps_data->out_transfer, SPS_IOVEC_FLAG_INT);
+		return 0;
+	}
+
+	/*
+	 * claim ownership of device
+	 */
+again:
+	if (cmpxchg(&pce_dev->owner, QCE_OWNER_NONE, QCE_OWNER_CLIENT)
+							!= QCE_OWNER_NONE) {
+		ndelay(40);
+		goto again;
+	}
+	no_of_queued_req = atomic_inc_return(&pce_dev->no_of_queued_req);
+	if (pce_dev->mode == IN_INTERRUPT_MODE) {
+		if (no_of_queued_req >= MAX_BUNCH_MODE_REQ) {
+			pce_dev->mode = IN_BUNCH_MODE;
+			pr_debug("pcedev %d mode switch to BUNCH\n",
+					pce_dev->dev_no);
+			_qce_set_flag(&pce_sps_data->out_transfer,
+					SPS_IOVEC_FLAG_INT);
+			pce_dev->intr_cadence = 0;
+			atomic_set(&pce_dev->bunch_cmd_seq, 1);
+			atomic_set(&pce_dev->last_intr_seq, 1);
+			mod_timer(&(pce_dev->timer),
+					(jiffies + DELAY_IN_JIFFIES));
+		} else {
+			_qce_set_flag(&pce_sps_data->out_transfer,
+					SPS_IOVEC_FLAG_INT);
+		}
+	} else {
+		pce_dev->intr_cadence++;
+		cadence = (preq_info->req_len >> 7) + 1;
+		if (cadence > SET_INTR_AT_REQ)
+			cadence = SET_INTR_AT_REQ;
+		if (pce_dev->intr_cadence < cadence || ((pce_dev->intr_cadence
+					== cadence) && pce_dev->cadence_flag))
+			atomic_inc(&pce_dev->bunch_cmd_seq);
+		else {
+			_qce_set_flag(&pce_sps_data->out_transfer,
+					SPS_IOVEC_FLAG_INT);
+			pce_dev->intr_cadence = 0;
+			atomic_set(&pce_dev->bunch_cmd_seq, 0);
+			atomic_set(&pce_dev->last_intr_seq, 0);
+			pce_dev->cadence_flag = !pce_dev->cadence_flag;
+		}
+	}
+
+	return 0;
+}
+
 static int _qce_aead_ccm_req(void *handle, struct qce_req *q_req)
 {
 	struct qce_device *pce_dev = (struct qce_device *) handle;
