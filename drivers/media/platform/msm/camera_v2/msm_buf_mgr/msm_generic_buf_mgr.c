@@ -95,7 +95,6 @@ static int32_t msm_buf_mngr_get_buf(struct msm_buf_mngr_device *dev,
 			new_entry->vb2_buf);
 		kfree(new_entry);
 	}
-
 	return rc;
 }
 
